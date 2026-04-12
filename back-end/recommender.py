@@ -172,87 +172,102 @@ class Recommender:
     # ── public API ────────────────────────────────────────────────────────────
 
     def recommend(
-        self,
-        profile_id: str,
-        top_n: int = 10,
-        diversity: float = 0.3,
-        fetch_n: int = 60,
-    ) -> list | None:
-        """
-        Returns top_n recommended profiles using MMR diversity.
+    self,
+    profile_id: str,
+    top_n: int = 10,
+    diversity: float = 0.3,
+    fetch_n: int = 60,
+) -> list | None:
 
-        diversity=0.0  →  pure relevance score ranking
-        diversity=0.3  →  recommended default (good balance)
-        diversity=1.0  →  maximum diversity, ignores score order
-        """
-        if profile_id not in self.profile_id_to_idx:
-            return None  # caller raises 404
+    if profile_id not in self.profile_id_to_idx:
+        return None
 
-        candidates       = [p for p in self.profiles["profile_id"] if p != profile_id]
-        feat_matrix, ids = self._build_feature_matrix(profile_id, candidates)
+    ia = self.profile_id_to_idx[profile_id]
+    a = self.profiles.iloc[ia]
 
-        if feat_matrix is None:
-            return []
+    # 🔥 SMART FILTER (FAST + RELEVANT)
+    df = self.profiles
 
-        # Score all candidates in one batch call (fast)
-        scores = self.model.predict(feat_matrix)
+    filtered = df[
+        (df["industry"] == a["industry"]) |
+        (df["location"] == a["location"])
+    ]
 
-        # Keep only top fetch_n by raw score (reduces MMR loop work)
-        top_idx    = np.argsort(scores)[::-1][:fetch_n]
-        top_ids    = [ids[i] for i in top_idx]
-        top_scores = scores[top_idx]
-        top_feats  = feat_matrix[top_idx]
+    # fallback if too small
+    if len(filtered) < 500:
+        filtered = df.sample(n=min(2000, len(df)), random_state=42)
 
-        # MMR selection loop
-        selected  = []
-        remaining = list(range(len(top_ids)))
+    # remove self
+    filtered = filtered[filtered["profile_id"] != profile_id]
 
-        for _ in range(min(top_n, len(remaining))):
-            if not remaining:
-                break
-            best_i, best_mmr = None, -99999.0
+    # 🔥 LIMIT candidates (HUGE SPEED BOOST)
+    candidate_ids = filtered["profile_id"].tolist()[:2000]
 
-            for i in remaining:
-                relevance = float(top_scores[i])
-                if not selected:
-                    mmr_score = relevance
-                else:
-                    max_sim   = float(
-                        cosine_similarity(
-                            top_feats[i].reshape(1, -1),
-                            top_feats[selected]
-                        ).max()
-                    )
-                    mmr_score = (1 - diversity) * relevance - diversity * max_sim
+    # build features
+    feat_matrix, ids = self._build_feature_matrix(profile_id, candidate_ids)
 
-                if mmr_score > best_mmr:
-                    best_mmr, best_i = mmr_score, i
+    if feat_matrix is None:
+        return []
 
-            selected.append(best_i)
-            remaining.remove(best_i)
+    # batch prediction
+    scores = self.model.predict(feat_matrix)
 
-        # Build result list
-        results = []
-        for rank, sel_i in enumerate(selected, 1):
-            pid = top_ids[sel_i]
-            ib  = self.profile_id_to_idx[pid]
-            p   = self.profiles.iloc[ib]
+    # top scoring candidates
+    top_idx = np.argsort(scores)[::-1][:fetch_n]
 
-            results.append({
-                "rank":             rank,
-                "profile_id":       str(pid),
-                "name":             str(p.get("name", "")),
-                "current_role":     str(p.get("current_role", "")),
-                "current_company":  str(p.get("current_company", "")),
-                "industry":         str(p.get("industry", "")),
-                "seniority_level":  str(p.get("seniority_level", "")),
-                "years_experience": round(float(p.get("years_experience", 0)), 1),
-                "remote_preference":str(p.get("remote_preference", "")),
-                "location":         str(p.get("location", "")),
-                "score":            round(float(top_scores[sel_i]), 4),
-            })
+    top_ids = [ids[i] for i in top_idx]
+    top_scores = scores[top_idx]
+    top_feats = feat_matrix[top_idx]
 
-        return results
+    # MMR (same logic)
+    selected = []
+    remaining = list(range(len(top_ids)))
+
+    for _ in range(min(top_n, len(remaining))):
+        best_i, best_mmr = None, -99999.0
+
+        for i in remaining:
+            relevance = float(top_scores[i])
+
+            if not selected:
+                mmr_score = relevance
+            else:
+                max_sim = float(
+                    cosine_similarity(
+                        top_feats[i].reshape(1, -1),
+                        top_feats[selected]
+                    ).max()
+                )
+                mmr_score = (1 - diversity) * relevance - diversity * max_sim
+
+            if mmr_score > best_mmr:
+                best_mmr, best_i = mmr_score, i
+
+        selected.append(best_i)
+        remaining.remove(best_i)
+
+    # build results
+    results = []
+    for rank, sel_i in enumerate(selected, 1):
+        pid = top_ids[sel_i]
+        ib = self.profile_id_to_idx[pid]
+        p = self.profiles.iloc[ib]
+
+        results.append({
+            "rank": rank,
+            "profile_id": str(pid),
+            "name": str(p.get("name", "")),
+            "current_role": str(p.get("current_role", "")),
+            "current_company": str(p.get("current_company", "")),
+            "industry": str(p.get("industry", "")),
+            "seniority_level": str(p.get("seniority_level", "")),
+            "years_experience": round(float(p.get("years_experience", 0)), 1),
+            "remote_preference": str(p.get("remote_preference", "")),
+            "location": str(p.get("location", "")),
+            "score": round(float(top_scores[sel_i]), 4),
+        })
+
+    return results
 
     def search_profiles(self, query: str = "", limit: int = 20) -> list:
         """Search profiles by name, role, industry, or company."""

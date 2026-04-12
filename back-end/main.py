@@ -14,9 +14,10 @@ recommender: Recommender | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global recommender
-    recommender = Recommender()   # loads model + all pkl files + builds matrices
+    print("🚀 Loading recommender (this may take time on cold start)...")
+    recommender = Recommender()
+    print("✅ Recommender ready!")
     yield
-    # nothing to clean up
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
