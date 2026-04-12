@@ -1,0 +1,87 @@
+# Large files
+*.iso
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tar.bz2
+
+# Large media files
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.flv
+*.wmv
+*.wav
+*.flac
+
+# Large archives
+*.psd
+*.ai
+*.sketch
+
+# Node modules and dependencies
+node_modules/
+bower_components/
+
+# Package manager caches
+npm-debug.log
+yarn-error.log
+
+# Build outputs
+dist/
+build/
+out/
+
+# IDE and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Database files
+*.db
+*.sqlite
+
+# Environment variables
+.env
+.env.local
+
+/frontend/node_modules/
+/backend/node_modules/
+/backend/__pycache__/
+/backend/venv/
+
+/frontend/dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Logs
+logs/
+*.log
+
+# OS temporary files
+*.tmp
+*.bak
+*~
+
+# Dependency lock files (optional)
+package-lock.json
+yarn.lock
+
+# IDE settings
+.eslintignore
+.prettierignore
+/gpu
+/Dataset
