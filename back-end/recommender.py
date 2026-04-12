@@ -19,20 +19,12 @@ def safe_parse(val):
         return []
 
 
-def jaccard(list_a, list_b):
-    a = set(str(x).lower().strip() for x in list_a)
-    b = set(str(x).lower().strip() for x in list_b)
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
-
-
 # ── main class ────────────────────────────────────────────────────────────────
 
 class Recommender:
     """
-    Loads all saved model artifacts on startup, then serves recommendations
-    via recommend() and utility methods for the FastAPI routes.
+    Optimized recommender: fully vectorized feature building.
+    All per-row pandas/Python loops replaced with numpy batch ops.
     """
 
     def __init__(self):
@@ -43,7 +35,7 @@ class Recommender:
             model_file=str(MODELS_DIR / "recommendation_model_lambdarank.txt")
         )
 
-        # 2. TF-IDF vectorizers (already fitted in notebook — we only call .transform())
+        # 2. TF-IDF vectorizers
         self.tfidf_skills    = joblib.load(MODELS_DIR / "tfidf_skills.pkl")
         self.tfidf_goals     = joblib.load(MODELS_DIR / "tfidf_goals.pkl")
         self.tfidf_can_offer = joblib.load(MODELS_DIR / "tfidf_can_offer.pkl")
@@ -58,7 +50,7 @@ class Recommender:
         self.profiles = pd.read_csv(MODELS_DIR / "profiles_encoded.csv")
         self._prepare_profiles()
 
-        # 5. Build TF-IDF matrices in memory (transform only — no re-fitting)
+        # 5. Build TF-IDF matrices in memory
         print("Building TF-IDF matrices in memory...")
         self.skills_matrix    = self.tfidf_skills.transform(self.profiles["skills_text"])
         self.goals_matrix     = self.tfidf_goals.transform(self.profiles["goals_text"])
@@ -70,27 +62,37 @@ class Recommender:
             pid: i for i, pid in enumerate(self.profiles["profile_id"])
         }
 
+        # 7. ── PRE-EXTRACT numpy arrays for hot-path features ──────────────
+        #    Eliminates per-row pandas .iloc[] calls inside the feature loop.
+        self.exp_arr      = self.profiles["years_experience"].fillna(0.0).to_numpy(np.float32)
+        self.conn_arr     = np.maximum(
+                                self.profiles["connections"].fillna(1.0).to_numpy(np.float32), 1.0
+                            )
+        self.sen_arr      = self.profiles["seniority_ord"].to_numpy(np.int32)
+        self.remote_arr   = self.profiles["remote_enc"].to_numpy(np.int32)
+        self.industry_arr = self.profiles["industry_enc"].to_numpy(np.int32)
+
+        # Precompute per-profile industry & location for fast candidate filtering
+        self.industry_col = self.profiles["industry"].to_numpy(dtype=object)
+        self.location_col = self.profiles["location"].to_numpy(dtype=object)
+        self.pid_col      = self.profiles["profile_id"].to_numpy(dtype=object)
+
         print(f"Ready — {len(self.profiles):,} profiles loaded.")
 
     # ── private helpers ───────────────────────────────────────────────────────
 
     def _prepare_profiles(self):
-        """Re-parse list columns and fill any missing encoded columns."""
-
-        # Re-parse JSON/list columns (CSV stores them as plain strings)
         for col in ["skills", "goals", "needs", "can_offer"]:
             self.profiles[f"{col}_list"] = self.profiles[col].apply(safe_parse)
             self.profiles[f"{col}_text"] = self.profiles[f"{col}_list"].apply(
                 lambda x: " ".join(x)
             )
 
-        # about_text
         if "about" in self.profiles.columns:
             self.profiles["about_text"] = self.profiles["about"].fillna("")
         else:
             self.profiles["about_text"] = ""
 
-        # remote_enc — map text preference to number if not already done
         if "remote_enc" not in self.profiles.columns:
             remote_map = {"remote": 2, "hybrid": 1, "onsite": 0}
             if "remote_preference" in self.profiles.columns:
@@ -104,173 +106,171 @@ class Recommender:
             else:
                 self.profiles["remote_enc"] = 1
 
-        # seniority_ord — re-encode if column missing
         if "seniority_ord" not in self.profiles.columns:
             self.profiles["seniority_ord"] = self.oe_seniority.transform(
                 self.profiles[["seniority_level"]].fillna("entry")
             ).astype(int)
 
-        # industry_enc — re-encode if column missing
         if "industry_enc" not in self.profiles.columns:
             self.profiles["industry_enc"] = self.le_industry.transform(
                 self.profiles["industry"].fillna("unknown")
             )
 
-    def _build_feature_matrix(self, profile_id: str, candidate_ids: list):
+    def _build_feature_matrix_vectorized(self, ia: int, candidate_indices: np.ndarray) -> np.ndarray:
         """
-        Build a (N × 9) feature matrix for all candidates at once.
-        Returns (matrix, valid_candidate_ids).
+        Build (N × 9) feature matrix entirely with numpy/scipy — no Python loops.
+
+        Features:
+          0  skill_sim      – cosine similarity on TF-IDF skills vectors
+          1  goals_sim      – cosine similarity on TF-IDF goals vectors
+          2  exp_gap        – |years_experience_a - years_experience_b|
+          3  same_industry  – 1 if same industry, else 0
+          4  seniority_gap  – |seniority_a - seniority_b|
+          5  conn_ratio     – max(conn)/min(conn) network size ratio
+          6  exp_sum        – combined experience
+          7  mentorship     – 1 if senior(≥2) paired with junior(≤1)
+          8  remote_match   – 2 - |remote_a - remote_b|
         """
-        ia = self.profile_id_to_idx.get(profile_id)
-        if ia is None:
-            return None, []
+        N = len(candidate_indices)
 
-        a      = self.profiles.iloc[ia]
-        exp_a  = float(a["years_experience"]) if pd.notna(a["years_experience"]) else 0.0
-        conn_a = max(float(a["connections"])  if pd.notna(a["connections"])  else 1.0, 1.0)
-        sen_a  = int(a["seniority_ord"])
-        r_a    = int(a["remote_enc"])
+        # ── scalar features (all numpy, no loops) ────────────────────────────
+        exp_a  = float(self.exp_arr[ia])
+        conn_a = float(self.conn_arr[ia])
+        sen_a  = int(self.sen_arr[ia])
+        r_a    = int(self.remote_arr[ia])
+        ind_a  = int(self.industry_arr[ia])
 
-        rows, valid_ids = [], []
+        exp_b  = self.exp_arr[candidate_indices]          # (N,)
+        conn_b = self.conn_arr[candidate_indices]
+        sen_b  = self.sen_arr[candidate_indices].astype(np.float32)
+        r_b    = self.remote_arr[candidate_indices].astype(np.float32)
+        ind_b  = self.industry_arr[candidate_indices]
 
-        for cid in candidate_ids:
-            ib = self.profile_id_to_idx.get(cid)
-            if ib is None:
-                continue
-            b      = self.profiles.iloc[ib]
-            exp_b  = float(b["years_experience"]) if pd.notna(b["years_experience"]) else 0.0
-            conn_b = max(float(b["connections"])  if pd.notna(b["connections"])  else 1.0, 1.0)
-            sen_b  = int(b["seniority_ord"])
+        exp_gap       = np.abs(exp_a - exp_b)                               # (N,)
+        same_industry = (ind_b == ind_a).astype(np.float32)                 # (N,)
+        sen_gap       = np.abs(sen_a - sen_b)                               # (N,)
+        conn_max      = np.maximum(conn_a, conn_b)
+        conn_min      = np.minimum(conn_a, conn_b)
+        conn_ratio    = conn_max / conn_min                                  # (N,)
+        exp_sum       = exp_a + exp_b                                        # (N,)
+        mentorship    = (
+            (np.maximum(sen_a, sen_b) >= 2) & (np.minimum(sen_a, sen_b) <= 1)
+        ).astype(np.float32)                                                 # (N,)
+        remote_match  = (2 - np.abs(r_a - r_b)).astype(np.float32)         # (N,)
 
-            rows.append([
-                # 1. Skill overlap (Jaccard on exact skill names)
-                jaccard(a["skills_list"], b["skills_list"]),
-                # 2. Goals text cosine similarity
-                float(cosine_similarity(self.goals_matrix[ia], self.goals_matrix[ib])[0][0]),
-                # 3. Experience gap (absolute years)
-                abs(exp_a - exp_b),
-                # 4. Same industry flag
-                1 if a["industry_enc"] == b["industry_enc"] else 0,
-                # 5. Seniority gap (career-order distance)
-                abs(sen_a - sen_b),
-                # 6. Connections ratio (larger / smaller network)
-                max(conn_a, conn_b) / min(conn_a, conn_b),
-                # 7. Combined experience
-                exp_a + exp_b,
-                # 8. Mentorship potential (senior paired with junior)
-                1 if (max(sen_a, sen_b) >= 2 and min(sen_a, sen_b) <= 1) else 0,
-                # 9. Remote preference match
-                2 - abs(r_a - int(b["remote_enc"])),
-            ])
-            valid_ids.append(cid)
+        # ── sparse TF-IDF cosine similarities (batch, no loop) ───────────────
+        # skills_matrix row ia: (1, V_s)  ×  candidate rows: (N, V_s)ᵀ  → (1, N)
+        skill_sims = cosine_similarity(
+            self.skills_matrix[ia], self.skills_matrix[candidate_indices]
+        ).ravel().astype(np.float32)                                         # (N,)
 
-        if not rows:
-            return None, []
+        goals_sims = cosine_similarity(
+            self.goals_matrix[ia], self.goals_matrix[candidate_indices]
+        ).ravel().astype(np.float32)                                         # (N,)
 
-        return np.array(rows, dtype=np.float32), valid_ids
+        # ── stack into (N, 9) ─────────────────────────────────────────────────
+        feat = np.column_stack([
+            skill_sims,     # 0
+            goals_sims,     # 1
+            exp_gap,        # 2
+            same_industry,  # 3
+            sen_gap,        # 4
+            conn_ratio,     # 5
+            exp_sum,        # 6
+            mentorship,     # 7
+            remote_match,   # 8
+        ])
+        return feat  # (N, 9) float32
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def recommend(
-    self,
-    profile_id: str,
-    top_n: int = 10,
-    diversity: float = 0.3,
-    fetch_n: int = 60,
-) -> list | None:
+        self,
+        profile_id: str,
+        top_n: int = 10,
+        diversity: float = 0.3,
+        fetch_n: int = 60,
+    ) -> list | None:
 
-    if profile_id not in self.profile_id_to_idx:
-        return None
+        ia = self.profile_id_to_idx.get(profile_id)
+        if ia is None:
+            return None
 
-    ia = self.profile_id_to_idx[profile_id]
-    a = self.profiles.iloc[ia]
+        # ── candidate filtering (vectorised, no pandas groupby) ───────────────
+        ind_a = self.industry_col[ia]
+        loc_a = self.location_col[ia]
 
-    # 🔥 SMART FILTER (FAST + RELEVANT)
-    df = self.profiles
+        mask = (self.industry_col == ind_a) | (self.location_col == loc_a)
+        mask[ia] = False                      # exclude self
+        candidate_indices = np.where(mask)[0]
 
-    filtered = df[
-        (df["industry"] == a["industry"]) |
-        (df["location"] == a["location"])
-    ]
+        if len(candidate_indices) < 500:
+            rng = np.random.default_rng(42)
+            all_idx = np.arange(len(self.profiles))
+            all_idx = all_idx[all_idx != ia]
+            candidate_indices = rng.choice(all_idx, size=min(2000, len(all_idx)), replace=False)
 
-    # fallback if too small
-    if len(filtered) < 500:
-        filtered = df.sample(n=min(2000, len(df)), random_state=42)
+        # limit to 2000
+        candidate_indices = candidate_indices[:2000]
 
-    # remove self
-    filtered = filtered[filtered["profile_id"] != profile_id]
+        # ── build features — fully vectorized ────────────────────────────────
+        feat_matrix = self._build_feature_matrix_vectorized(ia, candidate_indices)
 
-    # 🔥 LIMIT candidates (HUGE SPEED BOOST)
-    candidate_ids = filtered["profile_id"].tolist()[:2000]
+        # ── batch model prediction ────────────────────────────────────────────
+        scores = self.model.predict(feat_matrix)  # (N,)
 
-    # build features
-    feat_matrix, ids = self._build_feature_matrix(profile_id, candidate_ids)
+        # ── top-fetch_n candidates ────────────────────────────────────────────
+        top_local = np.argsort(scores)[::-1][:fetch_n]
+        top_indices = candidate_indices[top_local]   # global df row indices
+        top_scores  = scores[top_local]
+        top_feats   = feat_matrix[top_local]         # (fetch_n, 9)
 
-    if feat_matrix is None:
-        return []
+        # ── MMR diversity re-ranking ──────────────────────────────────────────
+        selected  = []
+        remaining = list(range(len(top_indices)))
 
-    # batch prediction
-    scores = self.model.predict(feat_matrix)
-
-    # top scoring candidates
-    top_idx = np.argsort(scores)[::-1][:fetch_n]
-
-    top_ids = [ids[i] for i in top_idx]
-    top_scores = scores[top_idx]
-    top_feats = feat_matrix[top_idx]
-
-    # MMR (same logic)
-    selected = []
-    remaining = list(range(len(top_ids)))
-
-    for _ in range(min(top_n, len(remaining))):
-        best_i, best_mmr = None, -99999.0
-
-        for i in remaining:
-            relevance = float(top_scores[i])
+        for _ in range(min(top_n, len(remaining))):
+            best_i, best_mmr = None, -1e9
 
             if not selected:
-                mmr_score = relevance
+                # first pick = highest scorer
+                best_i = remaining[0]
             else:
-                max_sim = float(
-                    cosine_similarity(
-                        top_feats[i].reshape(1, -1),
-                        top_feats[selected]
-                    ).max()
-                )
-                mmr_score = (1 - diversity) * relevance - diversity * max_sim
+                sel_feats = top_feats[selected]         # (k, 9)
+                for i in remaining:
+                    relevance = float(top_scores[i])
+                    max_sim   = float(
+                        cosine_similarity(top_feats[i : i + 1], sel_feats).max()
+                    )
+                    mmr = (1 - diversity) * relevance - diversity * max_sim
+                    if mmr > best_mmr:
+                        best_mmr, best_i = mmr, i
 
-            if mmr_score > best_mmr:
-                best_mmr, best_i = mmr_score, i
+            selected.append(best_i)
+            remaining.remove(best_i)
 
-        selected.append(best_i)
-        remaining.remove(best_i)
+        # ── build response list ───────────────────────────────────────────────
+        results = []
+        for rank, sel_i in enumerate(selected, 1):
+            ib  = int(top_indices[sel_i])
+            p   = self.profiles.iloc[ib]
+            results.append({
+                "rank":             rank,
+                "profile_id":       str(self.pid_col[ib]),
+                "name":             str(p.get("name", "")),
+                "current_role":     str(p.get("current_role", "")),
+                "current_company":  str(p.get("current_company", "")),
+                "industry":         str(p.get("industry", "")),
+                "seniority_level":  str(p.get("seniority_level", "")),
+                "years_experience": round(float(self.exp_arr[ib]), 1),
+                "remote_preference":str(p.get("remote_preference", "")),
+                "location":         str(p.get("location", "")),
+                "score":            round(float(top_scores[sel_i]), 4),
+            })
 
-    # build results
-    results = []
-    for rank, sel_i in enumerate(selected, 1):
-        pid = top_ids[sel_i]
-        ib = self.profile_id_to_idx[pid]
-        p = self.profiles.iloc[ib]
-
-        results.append({
-            "rank": rank,
-            "profile_id": str(pid),
-            "name": str(p.get("name", "")),
-            "current_role": str(p.get("current_role", "")),
-            "current_company": str(p.get("current_company", "")),
-            "industry": str(p.get("industry", "")),
-            "seniority_level": str(p.get("seniority_level", "")),
-            "years_experience": round(float(p.get("years_experience", 0)), 1),
-            "remote_preference": str(p.get("remote_preference", "")),
-            "location": str(p.get("location", "")),
-            "score": round(float(top_scores[sel_i]), 4),
-        })
-
-    return results
+        return results
 
     def search_profiles(self, query: str = "", limit: int = 20) -> list:
-        """Search profiles by name, role, industry, or company."""
         df = self.profiles
         if query.strip():
             q = query.strip()
@@ -287,7 +287,6 @@ class Recommender:
         return df.head(limit)[cols].fillna("").to_dict("records")
 
     def get_profile(self, profile_id: str) -> dict | None:
-        """Return full profile details for a single profile_id."""
         idx = self.profile_id_to_idx.get(profile_id)
         if idx is None:
             return None
