@@ -211,7 +211,7 @@ class Recommender:
             candidate_indices = rng.choice(all_idx, size=min(2000, len(all_idx)), replace=False)
 
         # limit to 2000
-        candidate_indices = candidate_indices[:2000]
+        candidate_indices = candidate_indices[:50000]
 
         # ── build features — fully vectorized ────────────────────────────────
         feat_matrix = self._build_feature_matrix_vectorized(ia, candidate_indices)
