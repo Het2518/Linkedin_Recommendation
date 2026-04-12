@@ -31,11 +31,7 @@ app = FastAPI(
 # Allow React dev server (port 5173) and production build to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # Vite dev server
-        "http://localhost:3000",   # fallback (CRA)
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=["*"],  # In production, specify your frontend domain here
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

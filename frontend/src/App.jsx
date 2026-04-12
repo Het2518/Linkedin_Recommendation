@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
 
-const API = 'http://localhost:8000'
-
+const API = 'https://linkedin-recommendation-1.onrender.com'
 async function apiSearchProfiles(q) {
   const r = await fetch(`${API}/profiles?q=${encodeURIComponent(q)}&limit=20`)
   const d = await r.json()
