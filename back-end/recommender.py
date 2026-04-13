@@ -1,12 +1,31 @@
+"""
+recommender.py  —  Two-Tower Neural Network + FAISS serving layer
+
+Inference pipeline (per request)
+─────────────────────────────────
+1. profile_id  →  19-d feature vector  (TF-IDF SVD + scalars)
+2. feature vec →  128-d embedding      (tower_a forward pass)
+3. embedding   →  top-100 ANN results  (FAISS IVFFlat inner-product search)
+4. top-100     →  re-scored & MMR      (tower_a·tower_b dot product + diversity)
+5. top-N       →  returned as list
+
+All 50K candidate embeddings are pre-computed at startup (tower_b).
+FAISS search is sub-millisecond — the model only runs tower_a once per request.
+"""
+
 import ast
+import json
 import joblib
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import faiss
 from pathlib import Path
 from sklearn.metrics.pairwise import cosine_similarity
 
-MODELS_DIR = Path(__file__).parent / "models"
+MODELS_DIR = Path(__file__).parent / "models_twotower"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -19,63 +38,115 @@ def safe_parse(val):
         return []
 
 
+# ── model definition (must match training code) ───────────────────────────────
+
+class Tower(nn.Module):
+    def __init__(self, input_dim: int, emb_dim: int = 128, dropout: float = 0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(64, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(128, emb_dim),
+        )
+
+    def forward(self, x):
+        return F.normalize(self.net(x), p=2, dim=-1)
+
+
+class TwoTowerModel(nn.Module):
+    def __init__(self, input_dim: int, emb_dim: int = 128, dropout: float = 0.2):
+        super().__init__()
+        self.tower_a = Tower(input_dim, emb_dim, dropout)
+        self.tower_b = Tower(input_dim, emb_dim, dropout)
+
+    def forward(self, x_a, x_b):
+        emb_a = self.tower_a(x_a)
+        emb_b = self.tower_b(x_b)
+        return torch.sigmoid((emb_a * emb_b).sum(dim=-1))
+
+    def encode_a(self, x):
+        return self.tower_a(x)
+
+    def encode_b(self, x):
+        return self.tower_b(x)
+
+
 # ── main class ────────────────────────────────────────────────────────────────
 
 class Recommender:
     """
-    Optimized recommender: fully vectorized feature building.
-    All per-row pandas/Python loops replaced with numpy batch ops.
+    Two-Tower recommender with FAISS ANN retrieval.
+
+    Startup sequence:
+      1. Load config.json → know dims
+      2. Load TF-IDF + SVD pipelines
+      3. Load profiles_encoded.csv
+      4. Load PyTorch two-tower model
+      5. Load FAISS index (pre-built, 50K vectors)
+      6. Load pre-computed all_embeddings.npy (for MMR cosine distance)
     """
 
     def __init__(self):
-        print("Loading model artifacts...")
+        print("Loading Two-Tower recommender...")
 
-        # 1. LightGBM LambdaRank model
-        self.model = lgb.Booster(
-            model_file=str(MODELS_DIR / "recommendation_model_lambdarank.txt")
-        )
+        # ── config ────────────────────────────────────────────────────────────
+        with open(MODELS_DIR / "config.json") as f:
+            cfg = json.load(f)
 
-        # 2. TF-IDF vectorizers
+        self.emb_dim      = cfg["emb_dim"]          # 128
+        self.profile_dim  = cfg["profile_dim"]       # 19
+        self.faiss_nprobe = cfg.get("faiss_nprobe", 32)
+
+        # ── TF-IDF + SVD pipelines ────────────────────────────────────────────
         self.tfidf_skills    = joblib.load(MODELS_DIR / "tfidf_skills.pkl")
+        self.svd_skills      = joblib.load(MODELS_DIR / "svd_skills.pkl")
         self.tfidf_goals     = joblib.load(MODELS_DIR / "tfidf_goals.pkl")
+        self.svd_goals       = joblib.load(MODELS_DIR / "svd_goals.pkl")
         self.tfidf_can_offer = joblib.load(MODELS_DIR / "tfidf_can_offer.pkl")
-        self.tfidf_needs     = joblib.load(MODELS_DIR / "tfidf_needs.pkl")
+        self.svd_can_offer   = joblib.load(MODELS_DIR / "svd_can_offer.pkl")
 
-        # 3. Categorical encoders
+        # ── scalar encoder + scaler ───────────────────────────────────────────
         self.oe_seniority = joblib.load(MODELS_DIR / "oe_seniority.pkl")
         self.le_industry  = joblib.load(MODELS_DIR / "le_industry.pkl")
-        self.le_city      = joblib.load(MODELS_DIR / "le_city.pkl")
+        self.scaler       = joblib.load(MODELS_DIR / "scalar_scaler.pkl")
 
-        # 4. Profiles dataframe
+        # ── profiles ──────────────────────────────────────────────────────────
         self.profiles = pd.read_csv(MODELS_DIR / "profiles_encoded.csv")
         self._prepare_profiles()
 
-        # 5. Build TF-IDF matrices in memory
-        print("Building TF-IDF matrices in memory...")
-        self.skills_matrix    = self.tfidf_skills.transform(self.profiles["skills_text"])
-        self.goals_matrix     = self.tfidf_goals.transform(self.profiles["goals_text"])
-        self.can_offer_matrix = self.tfidf_can_offer.transform(self.profiles["can_offer_text"])
-        self.needs_matrix     = self.tfidf_needs.transform(self.profiles["needs_text"])
+        # ── PyTorch model (eval mode, no gradients needed) ────────────────────
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model  = TwoTowerModel(self.profile_dim, self.emb_dim).to(self.device)
+        self.model.load_state_dict(
+            torch.load(MODELS_DIR / "two_tower_best.pt", map_location=self.device)
+        )
+        self.model.eval()
+        print(f"  PyTorch model loaded on {self.device}")
 
-        # 6. Fast O(1) lookup: profile_id → row index
+        # ── FAISS index ───────────────────────────────────────────────────────
+        self.faiss_index = faiss.read_index(str(MODELS_DIR / "profiles.faiss"))
+        self.faiss_index.nprobe = self.faiss_nprobe
+        print(f"  FAISS index loaded  ({self.faiss_index.ntotal:,} vectors, nprobe={self.faiss_nprobe})")
+
+        # ── pre-computed candidate embeddings (tower_b) for MMR ──────────────
+        self.all_embs = np.load(MODELS_DIR / "all_embeddings.npy").astype(np.float32)
+
+        # ── pre-built feature matrix (for fast profile vector lookup) ─────────
+        self._build_profile_vectors()
+
+        # ── O(1) lookup ───────────────────────────────────────────────────────
         self.profile_id_to_idx = {
             pid: i for i, pid in enumerate(self.profiles["profile_id"])
         }
-
-        # 7. ── PRE-EXTRACT numpy arrays for hot-path features ──────────────
-        #    Eliminates per-row pandas .iloc[] calls inside the feature loop.
-        self.exp_arr      = self.profiles["years_experience"].fillna(0.0).to_numpy(np.float32)
-        self.conn_arr     = np.maximum(
-                                self.profiles["connections"].fillna(1.0).to_numpy(np.float32), 1.0
-                            )
-        self.sen_arr      = self.profiles["seniority_ord"].to_numpy(np.int32)
-        self.remote_arr   = self.profiles["remote_enc"].to_numpy(np.int32)
-        self.industry_arr = self.profiles["industry_enc"].to_numpy(np.int32)
-
-        # Precompute per-profile industry & location for fast candidate filtering
-        self.industry_col = self.profiles["industry"].to_numpy(dtype=object)
-        self.location_col = self.profiles["location"].to_numpy(dtype=object)
-        self.pid_col      = self.profiles["profile_id"].to_numpy(dtype=object)
+        self.pid_col = self.profiles["profile_id"].to_numpy(dtype=object)
 
         print(f"Ready — {len(self.profiles):,} profiles loaded.")
 
@@ -88,20 +159,12 @@ class Recommender:
                 lambda x: " ".join(x)
             )
 
-        if "about" in self.profiles.columns:
-            self.profiles["about_text"] = self.profiles["about"].fillna("")
-        else:
-            self.profiles["about_text"] = ""
-
         if "remote_enc" not in self.profiles.columns:
             remote_map = {"remote": 2, "hybrid": 1, "onsite": 0}
             if "remote_preference" in self.profiles.columns:
                 self.profiles["remote_enc"] = (
-                    self.profiles["remote_preference"]
-                    .str.lower()
-                    .map(remote_map)
-                    .fillna(1)
-                    .astype(int)
+                    self.profiles["remote_preference"].str.lower()
+                    .map(remote_map).fillna(1).astype(int)
                 )
             else:
                 self.profiles["remote_enc"] = 1
@@ -109,78 +172,49 @@ class Recommender:
         if "seniority_ord" not in self.profiles.columns:
             self.profiles["seniority_ord"] = self.oe_seniority.transform(
                 self.profiles[["seniority_level"]].fillna("entry")
-            ).astype(int)
+            ).astype(float)
 
-        if "industry_enc" not in self.profiles.columns:
-            self.profiles["industry_enc"] = self.le_industry.transform(
-                self.profiles["industry"].fillna("unknown")
-            )
+    def _build_profile_vectors(self):
+        """Build the 19-d feature matrix for all 50K profiles (same as training)."""
+        print("  Building profile feature matrix...")
+        texts = self.profiles
 
-    def _build_feature_matrix_vectorized(self, ia: int, candidate_indices: np.ndarray) -> np.ndarray:
+        skills_dense    = self.svd_skills.transform(
+            self.tfidf_skills.transform(texts["skills_text"])
+        ).astype(np.float32)
+
+        goals_dense     = self.svd_goals.transform(
+            self.tfidf_goals.transform(texts["goals_text"])
+        ).astype(np.float32)
+
+        can_offer_dense = self.svd_can_offer.transform(
+            self.tfidf_can_offer.transform(texts["can_offer_text"])
+        ).astype(np.float32)
+
+        scalar = self.profiles[["years_experience", "seniority_ord", "remote_enc"]] \
+                     .fillna(0).astype(np.float32).values
+        scalar_norm = self.scaler.transform(scalar).astype(np.float32)
+
+        self.profile_vectors = np.concatenate(
+            [skills_dense, goals_dense, can_offer_dense, scalar_norm], axis=1
+        )
+        print(f"  Profile vectors: {self.profile_vectors.shape}")
+
+    def _profile_to_embedding(self, profile_idx: int, tower: str = "a") -> np.ndarray:
         """
-        Build (N × 9) feature matrix entirely with numpy/scipy — no Python loops.
-
-        Features:
-          0  skill_sim      – cosine similarity on TF-IDF skills vectors
-          1  goals_sim      – cosine similarity on TF-IDF goals vectors
-          2  exp_gap        – |years_experience_a - years_experience_b|
-          3  same_industry  – 1 if same industry, else 0
-          4  seniority_gap  – |seniority_a - seniority_b|
-          5  conn_ratio     – max(conn)/min(conn) network size ratio
-          6  exp_sum        – combined experience
-          7  mentorship     – 1 if senior(≥2) paired with junior(≤1)
-          8  remote_match   – 2 - |remote_a - remote_b|
+        Convert a profile row index → 128-d embedding using tower_a (query) or tower_b (candidate).
+        Returns (1, 128) float32 numpy array.
         """
-        N = len(candidate_indices)
+        vec = torch.tensor(
+            self.profile_vectors[profile_idx:profile_idx + 1], dtype=torch.float32
+        ).to(self.device)
 
-        # ── scalar features (all numpy, no loops) ────────────────────────────
-        exp_a  = float(self.exp_arr[ia])
-        conn_a = float(self.conn_arr[ia])
-        sen_a  = int(self.sen_arr[ia])
-        r_a    = int(self.remote_arr[ia])
-        ind_a  = int(self.industry_arr[ia])
-
-        exp_b  = self.exp_arr[candidate_indices]          # (N,)
-        conn_b = self.conn_arr[candidate_indices]
-        sen_b  = self.sen_arr[candidate_indices].astype(np.float32)
-        r_b    = self.remote_arr[candidate_indices].astype(np.float32)
-        ind_b  = self.industry_arr[candidate_indices]
-
-        exp_gap       = np.abs(exp_a - exp_b)                               # (N,)
-        same_industry = (ind_b == ind_a).astype(np.float32)                 # (N,)
-        sen_gap       = np.abs(sen_a - sen_b)                               # (N,)
-        conn_max      = np.maximum(conn_a, conn_b)
-        conn_min      = np.minimum(conn_a, conn_b)
-        conn_ratio    = conn_max / conn_min                                  # (N,)
-        exp_sum       = exp_a + exp_b                                        # (N,)
-        mentorship    = (
-            (np.maximum(sen_a, sen_b) >= 2) & (np.minimum(sen_a, sen_b) <= 1)
-        ).astype(np.float32)                                                 # (N,)
-        remote_match  = (2 - np.abs(r_a - r_b)).astype(np.float32)         # (N,)
-
-        # ── sparse TF-IDF cosine similarities (batch, no loop) ───────────────
-        # skills_matrix row ia: (1, V_s)  ×  candidate rows: (N, V_s)ᵀ  → (1, N)
-        skill_sims = cosine_similarity(
-            self.skills_matrix[ia], self.skills_matrix[candidate_indices]
-        ).ravel().astype(np.float32)                                         # (N,)
-
-        goals_sims = cosine_similarity(
-            self.goals_matrix[ia], self.goals_matrix[candidate_indices]
-        ).ravel().astype(np.float32)                                         # (N,)
-
-        # ── stack into (N, 9) ─────────────────────────────────────────────────
-        feat = np.column_stack([
-            skill_sims,     # 0
-            goals_sims,     # 1
-            exp_gap,        # 2
-            same_industry,  # 3
-            sen_gap,        # 4
-            conn_ratio,     # 5
-            exp_sum,        # 6
-            mentorship,     # 7
-            remote_match,   # 8
-        ])
-        return feat  # (N, 9) float32
+        with torch.no_grad():
+            if tower == "a":
+                emb = self.model.encode_a(vec)
+            else:
+                emb = self.model.encode_b(vec)
+        return emb.cpu().numpy().astype(np.float32)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -189,58 +223,61 @@ class Recommender:
         profile_id: str,
         top_n: int = 10,
         diversity: float = 0.3,
-        fetch_n: int = 60,
+        fetch_n: int = 100,        # ANN retrieves this many candidates before re-ranking
     ) -> list | None:
+        """
+        Full two-tower + MMR recommendation pipeline.
 
+        Step 1 — Embed query with tower_a        (1 forward pass, ~0.5ms)
+        Step 2 — ANN search in FAISS             (~1ms for 50K vectors)
+        Step 3 — Re-score top-fetch_n with       (dot product on pre-loaded embeddings)
+                  tower_a · tower_b embeddings
+        Step 4 — MMR diversity re-ranking        (greedy, O(fetch_n²))
+        Step 5 — Return top_n results
+        """
         ia = self.profile_id_to_idx.get(profile_id)
         if ia is None:
             return None
 
-        # ── candidate filtering (vectorised, no pandas groupby) ───────────────
-        ind_a = self.industry_col[ia]
-        loc_a = self.location_col[ia]
+        # ── Step 1: embed query (tower_a) ─────────────────────────────────────
+        q_emb = self._profile_to_embedding(ia, tower="a")   # (1, 128)
 
-        mask = (self.industry_col == ind_a) | (self.location_col == loc_a)
-        mask[ia] = False                      # exclude self
-        candidate_indices = np.where(mask)[0]
+        # ── Step 2: FAISS ANN search ──────────────────────────────────────────
+        distances, indices = self.faiss_index.search(q_emb, fetch_n + 1)   # +1 for self
+        distances = distances[0]  # (fetch_n+1,)
+        indices   = indices[0]    # (fetch_n+1,)  — global profile row indices
 
-        if len(candidate_indices) < 500:
-            rng = np.random.default_rng(42)
-            all_idx = np.arange(len(self.profiles))
-            all_idx = all_idx[all_idx != ia]
-            candidate_indices = rng.choice(all_idx, size=min(2000, len(all_idx)), replace=False)
+        # Remove self from results
+        mask      = indices != ia
+        distances = distances[mask][:fetch_n]
+        indices   = indices[mask][:fetch_n]
 
-        # limit to 2000
-        candidate_indices = candidate_indices[:50000]
+        # ── Step 3: re-score using precise dot product ─────────────────────────
+        # q_emb (1, 128)  ·  candidate_embs (fetch_n, 128)ᵀ  → (fetch_n,)
+        cand_embs  = self.all_embs[indices]           # (fetch_n, 128), pre-loaded
+        scores     = (q_emb @ cand_embs.T).ravel()    # (fetch_n,) — cosine similarity
 
-        # ── build features — fully vectorized ────────────────────────────────
-        feat_matrix = self._build_feature_matrix_vectorized(ia, candidate_indices)
+        # Sort by descending score
+        order      = np.argsort(scores)[::-1]
+        indices    = indices[order]
+        scores     = scores[order]
+        cand_embs  = cand_embs[order]
 
-        # ── batch model prediction ────────────────────────────────────────────
-        scores = self.model.predict(feat_matrix)  # (N,)
-
-        # ── top-fetch_n candidates ────────────────────────────────────────────
-        top_local = np.argsort(scores)[::-1][:fetch_n]
-        top_indices = candidate_indices[top_local]   # global df row indices
-        top_scores  = scores[top_local]
-        top_feats   = feat_matrix[top_local]         # (fetch_n, 9)
-
-        # ── MMR diversity re-ranking ──────────────────────────────────────────
+        # ── Step 4: MMR diversity re-ranking ──────────────────────────────────
         selected  = []
-        remaining = list(range(len(top_indices)))
+        remaining = list(range(len(indices)))
 
         for _ in range(min(top_n, len(remaining))):
             best_i, best_mmr = None, -1e9
 
             if not selected:
-                # first pick = highest scorer
                 best_i = remaining[0]
             else:
-                sel_feats = top_feats[selected]         # (k, 9)
+                sel_embs = cand_embs[selected]          # (k, 128)
                 for i in remaining:
-                    relevance = float(top_scores[i])
+                    relevance = float(scores[i])
                     max_sim   = float(
-                        cosine_similarity(top_feats[i : i + 1], sel_feats).max()
+                        cosine_similarity(cand_embs[i:i+1], sel_embs).max()
                     )
                     mmr = (1 - diversity) * relevance - diversity * max_sim
                     if mmr > best_mmr:
@@ -249,11 +286,11 @@ class Recommender:
             selected.append(best_i)
             remaining.remove(best_i)
 
-        # ── build response list ───────────────────────────────────────────────
+        # ── Step 5: build response ────────────────────────────────────────────
         results = []
         for rank, sel_i in enumerate(selected, 1):
-            ib  = int(top_indices[sel_i])
-            p   = self.profiles.iloc[ib]
+            ib = int(indices[sel_i])
+            p  = self.profiles.iloc[ib]
             results.append({
                 "rank":             rank,
                 "profile_id":       str(self.pid_col[ib]),
@@ -262,10 +299,9 @@ class Recommender:
                 "current_company":  str(p.get("current_company", "")),
                 "industry":         str(p.get("industry", "")),
                 "seniority_level":  str(p.get("seniority_level", "")),
-                "years_experience": round(float(self.exp_arr[ib]), 1),
-                "remote_preference":str(p.get("remote_preference", "")),
+                "years_experience": round(float(p.get("years_experience", 0) or 0), 1),
                 "location":         str(p.get("location", "")),
-                "score":            round(float(top_scores[sel_i]), 4),
+                "score":            round(float(scores[sel_i]), 4),
             })
 
         return results
@@ -273,7 +309,7 @@ class Recommender:
     def search_profiles(self, query: str = "", limit: int = 20) -> list:
         df = self.profiles
         if query.strip():
-            q = query.strip()
+            q    = query.strip()
             mask = (
                 df["name"].str.contains(q, case=False, na=False)
                 | df["current_role"].str.contains(q, case=False, na=False)
@@ -298,10 +334,9 @@ class Recommender:
             "current_company":   str(p.get("current_company", "")),
             "industry":          str(p.get("industry", "")),
             "seniority_level":   str(p.get("seniority_level", "")),
-            "years_experience":  round(float(p.get("years_experience", 0)), 1),
+            "years_experience":  round(float(p.get("years_experience", 0) or 0), 1),
             "location":          str(p.get("location", "")),
-            "remote_preference": str(p.get("remote_preference", "")),
-            "connections":       int(p.get("connections", 0)),
+            "connections":       int(p.get("connections", 0) or 0),
             "skills":            p.get("skills_list", []),
             "goals":             p.get("goals_list", []),
             "needs":             p.get("needs_list", []),

@@ -1,0 +1,9 @@
+{
+  "profile_dim": 19,
+  "emb_dim": 128,
+  "skills_svd_dim": 8,
+  "goals_svd_dim": 4,
+  "can_offer_svd_dim": 4,
+  "scalar_dim": 3,
+  "faiss_nprobe": 32
+}
