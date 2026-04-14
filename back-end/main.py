@@ -1,27 +1,39 @@
 """
-main.py — FastAPI serving layer for the Two-Tower LinkedIn Recommender
+main.py — FastAPI serving layer for ConnectIQ Two-Tower Recommender
 
-API surface (unchanged from LambdaRank version):
-  GET  /                      → health check
-  GET  /profiles?q=&limit=    → search profiles
-  GET  /profile/{profile_id}  → get single profile
-  POST /recommend             → get top-N recommendations
-  DEL  /cache                 → clear result cache
+Endpoints:
+  GET  /                   health + stats
+  GET  /stats              detailed recommender stats
+  GET  /profiles?q=&limit= instant token-index search
+  GET  /profile/{id}       full profile data
+  POST /recommend          Two-Tower + FAISS + MMR recommendations
+  DEL  /cache              clear result cache
 
-The recommender now uses Two-Tower + FAISS under the hood.
-No changes needed on the frontend — same request/response shapes.
+Changes vs previous:
+  • X-Response-Time header on every response
+  • /stats endpoint
+  • Proper HTTP 422 validation error messages
+  • Cache keyed on (profile_id, top_n, diversity_bucket, fetch_n)
+  • fetch_n exposed in request so UI can tune ANN pool size
 """
 
+from __future__ import annotations
+
+import logging
+import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from recommender import Recommender
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
+logger = logging.getLogger("main")
 
-# ── app lifespan ──────────────────────────────────────────────────────────────
+# ── lifespan ──────────────────────────────────────────────────────────────────
 
 recommender: Recommender | None = None
 
@@ -29,23 +41,16 @@ recommender: Recommender | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global recommender
-    print("🚀 Loading Two-Tower recommender...")
     recommender = Recommender()
-    print("✅ Recommender ready!")
     yield
 
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# ── app ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="LinkedIn Recommendation API — Two-Tower",
-    description=(
-        "Two-Tower Neural Network + FAISS ANN retrieval for professional connection recommendations. "
-        "Retrieval: ~1ms FAISS ANN search over 50K profiles. "
-        "Re-ranking: precise cosine similarity on pre-computed embeddings. "
-        "Diversity: Maximal Marginal Relevance (MMR)."
-    ),
-    version="2.0.0",
+    title="ConnectIQ API",
+    description="Two-Tower Neural Network + FAISS professional connection recommendations.",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -53,59 +58,73 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── request / response models ─────────────────────────────────────────────────
+# Timing middleware
+@app.middleware("http")
+async def add_timing(request: Request, call_next):
+    t0  = time.perf_counter()
+    res = await call_next(request)
+    ms  = round((time.perf_counter() - t0) * 1000, 1)
+    res.headers["X-Response-Time"] = f"{ms}ms"
+    return res
+
+
+# ── schemas ───────────────────────────────────────────────────────────────────
 
 class RecommendRequest(BaseModel):
-    profile_id: str   = Field(..., description="profile_id to get recommendations for")
-    top_n:      int   = Field(default=10,  ge=1, le=50,  description="How many results to return")
-    diversity:  float = Field(default=0.3, ge=0, le=1.0, description="MMR diversity weight (0=pure relevance, 1=pure diversity)")
-    fetch_n:    int   = Field(default=100, ge=10, le=500, description="ANN candidate pool size before re-ranking")
+    profile_id: str   = Field(..., description="profile_id from GET /profiles")
+    top_n:      int   = Field(10,  ge=1,  le=50)
+    diversity:  float = Field(0.3, ge=0.0, le=1.0)
+    fetch_n:    int   = Field(150, ge=10, le=500)
 
 
-# ── in-process result cache ───────────────────────────────────────────────────
+# ── cache ─────────────────────────────────────────────────────────────────────
 
-_rec_cache: dict = {}
-_MAX_CACHE = 500
-
-
-def _cache_key(profile_id: str, top_n: int, diversity: float, fetch_n: int) -> tuple:
-    return (profile_id, top_n, round(diversity, 1), fetch_n)
+_cache: dict[tuple, list] = {}
+_MAX  = 1000
 
 
-def _cache_get(key):
-    return _rec_cache.get(key)
+def _key(r: RecommendRequest) -> tuple:
+    return (r.profile_id, r.top_n, round(r.diversity, 1), r.fetch_n)
 
 
-def _cache_set(key, value):
-    if len(_rec_cache) >= _MAX_CACHE:
-        for k in list(_rec_cache.keys())[:100]:
-            del _rec_cache[k]
-    _rec_cache[key] = value
+def _get(k): return _cache.get(k)
+
+
+def _set(k, v):
+    if len(_cache) >= _MAX:
+        for old in list(_cache)[:200]:
+            del _cache[old]
+    _cache[k] = v
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["health"])
 def root():
+    s = recommender.stats()
     return {
-        "status":    "running",
-        "model":     "Two-Tower Neural Network + FAISS IVFFlat",
-        "docs":      "/docs",
-        "profiles":  f"{len(recommender.profiles):,} loaded",
-        "faiss":     f"{recommender.faiss_index.ntotal:,} vectors indexed",
-        "cache":     f"{len(_rec_cache)} entries",
+        "status":   "running",
+        "model":    "Two-Tower + FAISS IVFFlat",
+        "version":  "3.0.0",
+        **s,
+        "cache":    len(_cache),
+        "docs":     "/docs",
     }
+
+
+@app.get("/stats", tags=["health"])
+def stats():
+    return recommender.stats()
 
 
 @app.get("/profiles", tags=["profiles"])
 def search_profiles(
-    q:     str = Query(default=""),
+    q:     str = Query(default="", description="Search query (name, role, company, industry)"),
     limit: int = Query(default=20, ge=1, le=100),
 ):
     results = recommender.search_profiles(query=q, limit=limit)
@@ -114,26 +133,19 @@ def search_profiles(
 
 @app.get("/profile/{profile_id}", tags=["profiles"])
 def get_profile(profile_id: str):
-    profile = recommender.get_profile(profile_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail=f"Profile '{profile_id}' not found")
-    return profile
+    p = recommender.get_profile(profile_id)
+    if not p:
+        raise HTTPException(404, f"Profile '{profile_id}' not found")
+    return p
 
 
 @app.post("/recommend", tags=["recommendations"])
 def recommend(req: RecommendRequest):
-    key    = _cache_key(req.profile_id, req.top_n, req.diversity, req.fetch_n)
-    cached = _cache_get(key)
+    k      = _key(req)
+    cached = _get(k)
     if cached is not None:
-        return {
-            "profile_id":      req.profile_id,
-            "count":           len(cached),
-            "diversity":       req.diversity,
-            "fetch_n":         req.fetch_n,
-            "model":           "two-tower-faiss",
-            "cached":          True,
-            "recommendations": cached,
-        }
+        return {"cached": True,  "count": len(cached), "recommendations": cached,
+                "profile_id": req.profile_id, "diversity": req.diversity}
 
     results = recommender.recommend(
         profile_id=req.profile_id,
@@ -141,27 +153,15 @@ def recommend(req: RecommendRequest):
         diversity=req.diversity,
         fetch_n=req.fetch_n,
     )
-
     if results is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Profile '{req.profile_id}' not found. Use GET /profiles to find valid IDs.",
-        )
+        raise HTTPException(404, f"Profile '{req.profile_id}' not found. Use GET /profiles.")
 
-    _cache_set(key, results)
-
-    return {
-        "profile_id":      req.profile_id,
-        "count":           len(results),
-        "diversity":       req.diversity,
-        "fetch_n":         req.fetch_n,
-        "model":           "two-tower-faiss",
-        "cached":          False,
-        "recommendations": results,
-    }
+    _set(k, results)
+    return {"cached": False, "count": len(results), "recommendations": results,
+            "profile_id": req.profile_id, "diversity": req.diversity}
 
 
 @app.delete("/cache", tags=["admin"])
 def clear_cache():
-    _rec_cache.clear()
+    _cache.clear()
     return {"cleared": True}
